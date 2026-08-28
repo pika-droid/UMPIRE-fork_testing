@@ -1,3 +1,6 @@
+export TRANSFORMERS_VERBOSITY=error
+export PYTHONWARNINGS="ignore"
+
 # Initialize model variables
 gpu_list="${CUDA_VISIBLE_DEVICES:-0}" # GPU for parallel processing
 IFS=',' read -ra GPULIST <<< "$gpu_list"

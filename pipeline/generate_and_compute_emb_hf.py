@@ -9,6 +9,11 @@ import torch
 from tqdm import tqdm
 import math
 
+import warnings
+warnings.filterwarnings("ignore")
+import transformers
+transformers.logging.set_verbosity_error()
+
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
