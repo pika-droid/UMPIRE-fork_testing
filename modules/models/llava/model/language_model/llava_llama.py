@@ -152,7 +152,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs['images'] = images
         if image_sizes is not None:
             inputs['image_sizes'] = image_sizes
-        inputs.pop("cache_position")
+        inputs.pop("cache_position", None)
         return inputs
 
 AutoConfig.register("llava_llama", LlavaConfig)
