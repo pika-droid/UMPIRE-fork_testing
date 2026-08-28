@@ -2,11 +2,11 @@
 gpu_list="${CUDA_VISIBLE_DEVICES:-0}" # GPU for parallel processing
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 CHUNKS=${#GPULIST[@]}
-CKPT="llava-v1.5-13b"
-MODEL_PATH='liuhaotian/llava-v1.5-13b'
-SPLIT="okvqa" # dataset name split
+CKPT="llava-v1.5-7b"
+MODEL_PATH='liuhaotian/llava-v1.5-7b'
+SPLIT="vqav2" # dataset name split
 IMG_DIR='data/vqav2/val2014' # image folder (OKVQA and VQAv2 use MSCOCO val2014). Please download images at http://images.cocodataset.org/zips/val2014.zip and put the images in this folder before running the script
-QUES_FILE='data/okvqa/okvqa_processed.jsonl' # preprocessed question file
+QUES_FILE='data/vqav2/llava_OpenEnded_mscoco_val2014_questions_3k.jsonl' # preprocessed question file
 OUTDIR="output" # for saving
 
 # Process the first chunk (use for small datasets or debugging, or the first run to download the model).

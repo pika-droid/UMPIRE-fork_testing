@@ -1,8 +1,8 @@
 # !/bin/bash
 # This script computes UMPIRE and evaluates the results.
 # Change the paths as necessary.
-SPLIT="okvqa" # dataset name split
-CKPT="llava-v1.5-13b"
+SPLIT="vqav2" # dataset name split
+CKPT="llava-v1.5-7b"
 generation_file="output/${SPLIT}/generation_embedding/${CKPT}.pkl"
 output_dir="output/${SPLIT}/results"
 
