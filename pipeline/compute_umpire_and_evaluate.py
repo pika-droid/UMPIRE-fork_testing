@@ -79,7 +79,7 @@ def compute_semantic_entropy_from_cluster_ids(sample):
     semantic_entropy_score = predictive_entropy_rao(log_likelihood_by_cluster)
     return semantic_entropy_score
 
-def update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=15, eval_col='rougeL_to_target', eval_thresold=0.8, conf_col_to_eval_list=[], unc_col_to_eval_list=[]):
+def update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=15, eval_col='rougeL_to_target', eval_thresold=0.8, conf_col_to_eval_list=[], unc_col_to_eval_list=[], model_type='logistic'):
     if eval_col == "exact_match":
         image_correct_df = image_df.loc[image_df[eval_col] == 1]
         image_wrong_df = image_df.loc[image_df[eval_col] == 0]
@@ -93,14 +93,14 @@ def update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=15, eval_c
     for col in conf_col_to_eval_list + unc_col_to_eval_list:
         if col in conf_col_to_eval_list:
             auc = ROC_AUROC(image_wrong_df[col], image_correct_df[col])[-1]
-            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type='minmax', ece_mode='ece', is_uncertainty=False)
+            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, ece_mode='ece', is_uncertainty=False)
             tpr_at_10_fpr = get_tpr_at_fpr(image_wrong_df[col], image_correct_df[col], 0.1)
             tpr_at_1_fpr = get_tpr_at_fpr(image_wrong_df[col], image_correct_df[col], 0.01)
             aurac = compute_aurac_from_image_df(image_df, col, uncertainty=False, eval_col=eval_col)
             pearsonr = -compute_pearsonr(image_df[col], image_df[eval_col], num_bins=cpc_num_bins)[0]
         else:
             auc = ROC_AUROC(image_correct_df[col], image_wrong_df[col])[-1]
-            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type='minmax', ece_mode='ece')
+            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, ece_mode='ece')
             tpr_at_10_fpr = get_tpr_at_fpr(image_correct_df[col], image_wrong_df[col], 0.1)
             tpr_at_1_fpr = get_tpr_at_fpr(image_correct_df[col], image_wrong_df[col], 0.01)
             aurac = compute_aurac_from_image_df(image_df, col, uncertainty=True, eval_col=eval_col)
@@ -125,6 +125,9 @@ if __name__ == "__main__":
                         help='Directory to save the output files')
     parser.add_argument('--jitter', type=float, default=1e-8,
                         help='Jitter value for numerical stability in logdet computation')
+    parser.add_argument('--calibration_model', type=str, default='logistic',
+                        choices=['logistic', 'minmax', 'isotonic', 'linear'],
+                        help='Calibration model type for ECE computation')
     parser.add_argument('--re_cluster_semantic_entropy', action='store_true',
                         help='Whether to re-cluster the generation responses for Semantic Entropy computation. Take note that this will cost few hours to run')
     args = parser.parse_args()
@@ -185,7 +188,7 @@ if __name__ == "__main__":
 
     ### Evaluate Uncertainty Metrics ###
     unc_metrics = ['ln_entropy', 'semantic_entropy', 'eigen_score', 'umpire']
-    result_dict = update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=50, unc_col_to_eval_list=unc_metrics)
+    result_dict = update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=50, unc_col_to_eval_list=unc_metrics, model_type=args.calibration_model)
     result_df = pd.DataFrame().from_dict(result_dict, orient='index')
     result_df = result_df.map(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
     print(df_to_markdown_bold(result_df))

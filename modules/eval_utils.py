@@ -161,8 +161,9 @@ def get_calibrate_ece(image_df, unc_column, eval_col='exact_match', num_bins=15,
         x_dev = np.array(x_dev).reshape(-1, 1)
         x_test = test_df[[unc_column]].to_numpy().reshape(-1, 1)
         if model_type == 'logistic':
+            Y_dev = dev_df[eval_col].astype(int).to_numpy()
             model = LogisticRegression(random_state=random_seed)
-            model.fit(x_dev, y_dev)
+            model.fit(X_dev, Y_dev)
             test_df['u_score'] = model.predict_proba(x_test)[:, 1]
         elif model_type == 'linear':
             model = LinearRegression()

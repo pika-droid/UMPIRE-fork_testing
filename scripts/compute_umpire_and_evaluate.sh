@@ -9,4 +9,5 @@ output_dir="output/${SPLIT}/results"
 # Compute UMPIRE and evaluate
 CUDA_VISIBLE_DEVICES=0 python pipeline/compute_umpire_and_evaluate.py \
         --generation_file=$generation_file \
-        --output_dir=$output_dir
+        --output_dir=$output_dir \
+        --calibration_model=logistic
