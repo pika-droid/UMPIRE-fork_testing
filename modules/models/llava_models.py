@@ -103,6 +103,10 @@ class HuggingfaceModel(BaseModel):
             self.tokenizer = tokenizer
             self.model = model
             self.image_processor = image_processor
+            self._llava = llava_mods
+            self.process_images_fn = llava_mods.get("process_images") or process_images
+            self.tokenizer_image_token_fn = llava_mods.get("tokenizer_image_token") or tokenizer_image_token
+            self.image_token_index = llava_mods.get("IMAGE_TOKEN_INDEX", IMAGE_TOKEN_INDEX)
         else:
             raise ValueError(f"Unsupported model: {model_name}")
 
@@ -129,14 +133,14 @@ class HuggingfaceModel(BaseModel):
 
         if isinstance(image_path, str):
             image = Image.open(image_path).convert('RGB')
-            image_tensor = process_images([image], self.image_processor, self.model.config)[0]
+            image_tensor = self.process_images_fn([image], self.image_processor, self.model.config)[0]
         elif isinstance(image_path, Image.Image):
             image = image_path
-            image_tensor = process_images([image], self.image_processor, self.model.config)[0]
+            image_tensor = self.process_images_fn([image], self.image_processor, self.model.config)[0]
         elif isinstance(image_path, torch.Tensor):
             image_tensor = image_path
 
-        input_ids = tokenizer_image_token(new_prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+        input_ids = self.tokenizer_image_token_fn(new_prompt, self.tokenizer, self.image_token_index, return_tensors='pt')
         input_ids = torch.unsqueeze(input_ids, dim=0)
         image_tensor = torch.unsqueeze(image_tensor, dim=0)
         
