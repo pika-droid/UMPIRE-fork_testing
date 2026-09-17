@@ -4,7 +4,6 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import argparse
-from sklearn.utils.extmath import fast_logdet
 
 # Register tqdm with pandas
 tqdm.pandas()
@@ -15,22 +14,30 @@ from modules.eval_utils import ROC_AUROC, compute_pearsonr, get_calibrate_ece, g
     df_to_markdown_bold, split_balanced_data
 
 from modules.logdet_utils import normalize_embedding, get_generation_embeddings, get_quad_entropy, \
-    get_normalized_entropy, compute_eigenscore
+    get_normalized_entropy, compute_eigenscore, compute_logdet, slice_rollouts
 
 def get_adaptive_alpha_dev_set(image_df, logdet_col, quality_col, dev_ratio=0.1, random_seed=10):
-    # Randomly get dev set, and compute the ratio of median logdet and median quality as the adaptive alpha. 
-    # Note that we do not use balanced split here as we want the dev set to reflect the real distribution of the data.
     dev_df, test_df = split_balanced_data(image_df, dev_ratio, random_seed, balanced=False)
     quality_values = dev_df[quality_col]
     logdet_values = dev_df[logdet_col]
-    return np.abs(logdet_values.median() / quality_values.median())
+    denom = quality_values.median()
+    if denom == 0 or np.isnan(denom):
+        denom = quality_values.mean()
+    if denom == 0 or np.isnan(denom):
+        denom = 1e-5
+    num = np.abs(logdet_values.median())
+    if np.isnan(num):
+        num = np.abs(logdet_values.mean())
+    return float(num / denom)
 
 ###### UMPIRE implementation ######
-def get_logdet_term(sample, jitter=1e-8):
-    embeddings = get_generation_embeddings(sample) # shape: (k, embedding_dim)
+def get_logdet_term(sample, jitter=1e-6):
+    embeddings = get_generation_embeddings(sample)
     k = embeddings.shape[0]
-    kernel = np.dot(embeddings, embeddings.T) # shape: (k, k)
-    return 1/(2 * k) * fast_logdet(kernel + np.identity(kernel.shape[0])*jitter)
+    if k == 0:
+        return 0.0
+    kernel = np.dot(embeddings, embeddings.T)
+    return 1/(2 * k) * compute_logdet(kernel, jitter=jitter)
 
 def compute_umpire(sample, jitter=1e-8, alpha=1, length_normalize=False):
     # get embedding and log-likelihoods
@@ -53,13 +60,33 @@ def compute_umpire(sample, jitter=1e-8, alpha=1, length_normalize=False):
 ###### Semantic Entropy ######
 # Adapted from https://github.com/lorenzkuhn/semantic_uncertainty
 def compute_semantic_entropy_from_scratch(sample, entailment_model):
-    # Get semantic clusters
-    cluster_ids = get_semantic_ids(
-        strings_list=sample['generations_text'], 
-        model=entailment_model, 
-        strict_entailment=True,
-        example=None # as Deberta model don't need this.
-    )
+    texts = sample['generations_text']
+    if not texts:
+        return 0.0
+    norm_texts = [t.strip() for t in texts]
+    unique_texts = list(dict.fromkeys(norm_texts))
+    if len(unique_texts) <= 1:
+        return 0.0
+
+    from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao
+    # Fast-path: if there are duplicate answers, only run DeBERTa on unique representatives
+    if len(unique_texts) < len(norm_texts):
+        unique_cluster_ids = get_semantic_ids(
+            strings_list=unique_texts,
+            model=entailment_model,
+            strict_entailment=True,
+            example=None,
+        )
+        text_to_cluster = {ut: cid for ut, cid in zip(unique_texts, unique_cluster_ids)}
+        cluster_ids = [text_to_cluster[t] for t in norm_texts]
+    else:
+        cluster_ids = get_semantic_ids(
+            strings_list=texts,
+            model=entailment_model,
+            strict_entailment=True,
+            example=None,
+        )
+
     # Sum log-likelihoods for each token sequence
     llh_sums = [np.sum(llh) for llh in sample['generations_log_likelihood']]
     # Aggregate by cluster
@@ -130,6 +157,8 @@ if __name__ == "__main__":
                         help='Calibration model type for ECE computation')
     parser.add_argument('--re_cluster_semantic_entropy', action='store_true',
                         help='Whether to re-cluster the generation responses for Semantic Entropy computation. Take note that this will cost few hours to run')
+    parser.add_argument('--rollout_budgets', type=str, default=None,
+                        help='Comma-separated rollout budgets K to evaluate via prefix slicing')
     args = parser.parse_args()
 
     print("Loading generation file from", args.generation_file, "...")
@@ -140,66 +169,55 @@ if __name__ == "__main__":
             llava_results = pickle.load(r)
     else:
         raise FileNotFoundError(f"Generation file {file_path} not found.")
-    image_df = pd.DataFrame().from_dict(llava_results)
-    print("Generation file loaded. Number of samples:", len(image_df))
 
-    # Ensure the 'embedding' column exists
-    if 'internal_embedding' in image_df.columns:
-        image_df = image_df.rename(columns={'internal_embedding': 'embedding'})
-    if 'embedding' not in image_df.columns:
-        raise ValueError("The 'embedding' column is missing from the DataFrame.")
+    budgets = [int(b.strip()) for b in args.rollout_budgets.split(',') if b.strip()] if args.rollout_budgets else [None]
+    all_k_results = {}
 
-    ### Compute Uncertainty Metrics ###
-    # Normalize embeddings first
-    image_df['norm_embedding'] = image_df['embedding'].apply(normalize_embedding)
-
-    # Compute adaptive alpha on calibration set
-    image_df['logdet'] = image_df.apply(lambda x: get_logdet_term(x, jitter=args.jitter), axis=1)
-    image_df['quad_entropy'] = image_df['generations_log_likelihood'].apply(lambda llh: get_quad_entropy(llh))
-    adaptive_alpha = get_adaptive_alpha_dev_set(image_df, logdet_col='logdet', quality_col='quad_entropy', dev_ratio=0.1, random_seed=10)
-    print("Adaptive alpha", adaptive_alpha)
-
-    # Compute UMPIRE with adaptive alpha
-    tqdm.pandas(desc="Computing UMPIRE")
-    image_df['umpire'] = image_df.progress_apply(lambda x: compute_umpire(x, alpha=adaptive_alpha, jitter=args.jitter), axis=1, ) 
-
-    # Compute baselines
-    ## length-normalized entropy and eigenscore
-    tqdm.pandas(desc="Computing length-normalized entropy")
-    image_df['ln_entropy'] = image_df['generations_log_likelihood'].progress_apply(get_normalized_entropy)
-    tqdm.pandas(desc="Computing eigenscore")
-    image_df['eigen_score'] = image_df.progress_apply(lambda x: compute_eigenscore(x, jitter=args.jitter), axis=1)
-    ## Semantic Entropy
-    from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao    
-    if args.re_cluster_semantic_entropy or 'cluster_ids' not in image_df.columns:
-        if args.re_cluster_semantic_entropy:
-            print("Re-clustering flag on")
-        elif 'cluster_ids' not in image_df.columns:
-            print("No pre-computed cluster ids found")
-        print("Re-clustering generations for semantic entropy computation...")
-        from modules.semantic_entropy import EntailmentDeberta
-        entailment_model = EntailmentDeberta()
-        tqdm.pandas(desc="Computing semantic entropy")
-        image_df['semantic_entropy'] = image_df.progress_apply(lambda x: compute_semantic_entropy_from_scratch(x, entailment_model), axis=1)
-    else:
-        print("Using pre-computed cluster ids for semantic entropy computation...")
-        tqdm.pandas(desc="Computing semantic entropy from pre-computed cluster ids")
-        image_df['semantic_entropy'] = image_df.progress_apply(lambda x: compute_semantic_entropy_from_cluster_ids(x), axis=1)
-
-    ### Evaluate Uncertainty Metrics ###
-    unc_metrics = ['ln_entropy', 'semantic_entropy', 'eigen_score', 'umpire']
-    result_dict = update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=50, unc_col_to_eval_list=unc_metrics, model_type=args.calibration_model)
-    result_df = pd.DataFrame().from_dict(result_dict, orient='index')
-    result_df = result_df.map(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
-    print(df_to_markdown_bold(result_df))
-
-    # Save results
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    # save result_df as json
-    result_json_file = os.path.join(args.output_dir, 'umpire_results.json')
-    result_df.to_json(result_json_file, orient='index', indent=4)
+    for k in budgets:
+        current_results = [slice_rollouts(s, k) for s in llava_results] if k is not None else llava_results
+        image_df = pd.DataFrame().from_dict(current_results)
+        k_str = f"K={k}" if k is not None else "full"
+        print(f"Evaluating {k_str} (samples={len(image_df)})...")
 
-    # # Save the updated DataFrame with uncertainty metrics
-    # image_df.to_pickle(os.path.join(args.output_dir, 'image_df_with_uncertainty.pkl'))
+        if 'internal_embedding' in image_df.columns and 'embedding' not in image_df.columns:
+            image_df = image_df.rename(columns={'internal_embedding': 'embedding'})
+        if 'embedding' not in image_df.columns:
+            raise ValueError("The 'embedding' column is missing from the DataFrame.")
+
+        image_df['norm_embedding'] = image_df['embedding'].apply(normalize_embedding)
+        image_df['logdet'] = image_df.apply(lambda x: get_logdet_term(x, jitter=args.jitter), axis=1)
+        image_df['quad_entropy'] = image_df['generations_log_likelihood'].apply(lambda llh: get_quad_entropy(llh))
+        adaptive_alpha = get_adaptive_alpha_dev_set(image_df, logdet_col='logdet', quality_col='quad_entropy', dev_ratio=0.1, random_seed=10)
+        image_df['umpire'] = image_df.apply(lambda x: compute_umpire(x, alpha=adaptive_alpha, jitter=args.jitter), axis=1)
+
+        image_df['ln_entropy'] = image_df['generations_log_likelihood'].apply(get_normalized_entropy)
+        image_df['eigen_score'] = image_df.apply(lambda x: compute_eigenscore(x, jitter=args.jitter), axis=1)
+
+        from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao    
+        if args.re_cluster_semantic_entropy or 'cluster_ids' not in image_df.columns:
+            from modules.semantic_entropy import EntailmentDeberta
+            entailment_model = EntailmentDeberta()
+            image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_scratch(x, entailment_model), axis=1)
+        else:
+            image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_cluster_ids(x), axis=1)
+
+        unc_metrics = ['ln_entropy', 'semantic_entropy', 'eigen_score', 'umpire']
+        result_dict = update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=50, unc_col_to_eval_list=unc_metrics, model_type=args.calibration_model)
+        result_df = pd.DataFrame().from_dict(result_dict, orient='index')
+        result_df = result_df.map(lambda x: round(x, 3) if isinstance(x, (float, int)) else x)
+        print(df_to_markdown_bold(result_df))
+
+        out_name = f'umpire_results_k{k}.json' if k is not None else 'umpire_results.json'
+        result_df.to_json(os.path.join(args.output_dir, out_name), orient='index', indent=4)
+        if k is not None:
+            all_k_results[f"k_{k}"] = result_dict
+            if k == max(budgets):
+                result_df.to_json(os.path.join(args.output_dir, 'umpire_results.json'), orient='index', indent=4)
+
+    if all_k_results:
+        import json
+        with open(os.path.join(args.output_dir, 'umpire_results_all_k.json'), 'w') as f:
+            json.dump(all_k_results, f, indent=4)

@@ -38,6 +38,7 @@ parser.add_argument('--dataset', type=str, default='coqa')
 parser.add_argument("--beam_search", action='store_true')
 
 # llava args
+parser.add_argument("--arch", type=str, default="m3", choices=["m3", "mqt"])
 parser.add_argument("--image_folder", type=str, default="")
 parser.add_argument("--question_file", type=str, default="tables/question.jsonl")
 parser.add_argument("--outdir", type=str, default="/output/")
@@ -71,9 +72,9 @@ elif 'contactdoctor' in args.model_path.lower():
 elif 'qwen' in args.model_path.lower():
     from modules.models.qwen_models import QwenModel
     model = QwenModel(model_name=args.model_path, stop_sequences=[], max_new_tokens=args.max_new_tokens)
-elif 'liuhaotian' in args.model_path.lower():
+elif any(k in args.model_path.lower() for k in ['liuhaotian', 'llava', 'm3', 'mqt']):
     from modules.models.llava_models import HuggingfaceModel as LlavaModel
-    model = LlavaModel(model_name=args.model_path, stop_sequences=[], max_new_tokens=args.max_new_tokens)
+    model = LlavaModel(model_name=args.model_path, stop_sequences=[], max_new_tokens=args.max_new_tokens, arch=args.arch)
 else:
     from modules.models.vision_models import VisionModel
     model = VisionModel(model_name=args.model_path, stop_sequences=[], max_new_tokens=args.max_new_tokens)     
@@ -100,27 +101,66 @@ rouge = evaluate.load('rouge')
 exact_match_metric = evaluate.load("exact_match")
 
 # Generation
+pathlib.Path(f'{args.outdir}').mkdir(parents=True, exist_ok=True)
+final_out = f'{args.outdir}/generations.pkl'
+tmp_out = f'{args.outdir}/generations.pkl.tmp'
+
 sequences = []
+processed_qids = set()
+for candidate_file in [final_out, tmp_out]:
+    if os.path.exists(candidate_file):
+        try:
+            with open(candidate_file, 'rb') as f:
+                sequences = pickle.load(f)
+                processed_qids = {str(s['question_id']) for s in sequences}
+                break
+        except Exception:
+            sequences = []
+            processed_qids = set()
+
 number_of_generations = args.num_generations_per_prompt
 for line in tqdm(questions, total=len(questions)):
     idx = line["question_id"]
+    if str(idx) in processed_qids:
+        continue
+
     cur_prompt = prefix_prompt + line["text"]
-    image_name = line['image']
-    image_path = os.path.join(args.image_folder, image_name)
+    image_name = line.get('image', '')
+    if image_name and args.image_folder:
+        cand_path = os.path.join(args.image_folder, image_name)
+        image_path = cand_path if os.path.exists(cand_path) else None
+    elif image_name and os.path.exists(image_name):
+        image_path = image_name
+    else:
+        image_path = None
 
-    # Most likely generation for evaluation
-    most_likely_generation_output_text, most_likely_generation_log_likelihood, most_likely_generation_embedding = model.predict_prompt_image(cur_prompt, image_path, temperature=0.1, top_p=0.9)
+    # Preprocess inputs once: visual features and prompt KV-cache are shared
+    preprocessed = None
+    if hasattr(model, 'preprocess_input'):
+        preprocessed = model.preprocess_input(cur_prompt, image_path)
 
-    # Sampling 
-    generation_list = []
-    generation_log_likelihood_list = []
-    embedding = []
-    for i in range(number_of_generations):
-        generation, generation_log_likelihood, generation_embedding = model.predict_prompt_image(cur_prompt, image_path, temperature=args.temperature, top_p=args.top_p)
-        generation_list.append(generation)
-        generation_log_likelihood_list.append(generation_log_likelihood)
-        embedding.append(generation_embedding)
-    embedding = np.array(torch.stack(embedding).tolist())
+    # Most likely generation for evaluation (greedy pass)
+    most_likely_generation_output_text, most_likely_generation_log_likelihood, most_likely_generation_embedding = model.predict_prompt_image(
+        cur_prompt, image_path, temperature=0.1, top_p=0.9, preprocessed_inputs=preprocessed
+    )
+
+    # Parallel Multi-Rollout Sampling (K rollouts)
+    if hasattr(model, 'predict_batched_rollouts'):
+        generation_list, generation_log_likelihood_list, embedding = model.predict_batched_rollouts(
+            cur_prompt, image_path, num_rollouts=number_of_generations, temperature=args.temperature, top_p=args.top_p, preprocessed_inputs=preprocessed
+        )
+    else:
+        generation_list = []
+        generation_log_likelihood_list = []
+        embedding = []
+        for i in range(number_of_generations):
+            generation, generation_log_likelihood, generation_embedding = model.predict_prompt_image(
+                cur_prompt, image_path, temperature=args.temperature, top_p=args.top_p, preprocessed_inputs=preprocessed
+            )
+            generation_list.append(generation)
+            generation_log_likelihood_list.append(generation_log_likelihood)
+            embedding.append(generation_embedding)
+        embedding = np.array(torch.stack(embedding).tolist())
     
     # Save dictionary
     sequence_dict = {
@@ -166,10 +206,15 @@ for line in tqdm(questions, total=len(questions)):
                                                             sequence_dict[rouge_type + '_to_target'])
     sequence_dict['internal_embedding'] = embedding
     sequences.append(sequence_dict)     
+    processed_qids.add(str(idx))
 
-pathlib.Path(f'{args.outdir}').mkdir(parents=True, exist_ok=True)
+    if len(sequences) % 100 == 0:
+        with open(tmp_out, 'wb') as outfile:
+            pickle.dump(sequences, outfile)
+        os.replace(tmp_out, final_out)
 
-with open(f'{args.outdir}/generations.pkl', 'wb') as outfile:
+with open(tmp_out, 'wb') as outfile:
     pickle.dump(sequences, outfile)
+os.replace(tmp_out, final_out)
 
 print("Done!")

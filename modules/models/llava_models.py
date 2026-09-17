@@ -1,6 +1,7 @@
 import copy
 import logging
 from collections import Counter
+from typing import Any
 import torch
 
 import accelerate
@@ -23,6 +24,8 @@ from .llava.conversation import conv_templates, SeparatorStyle
 
 from .base_model import BaseModel
 from .base_model import STOP_SEQUENCES
+from .patches import apply_transformers_compatibility_patches
+from .llava_compat import load_llava_modules
 
 class StoppingCriteriaSub(StoppingCriteria):
     """Stop generations when they match a particular text or token."""
@@ -38,44 +41,70 @@ class StoppingCriteriaSub(StoppingCriteria):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         del scores  # `scores` arg is required by StoppingCriteria but unused by us.
-        for stop in self.stops:
-            if self.match_on == 'text':
-                generation = self.tokenizer.decode(input_ids[0][self.initial_length:], skip_special_tokens=False)
-                match = stop in generation
-            elif self.match_on == 'tokens':
-                # Can be dangerous due to tokenizer ambiguities.
-                match = stop in input_ids[0][-len(stop):]
-            else:
-                raise
-            if match:
-                return True
-        return False
+        if input_ids.shape[0] == 1:
+            for stop in self.stops:
+                if self.match_on == 'text':
+                    generation = self.tokenizer.decode(input_ids[0][self.initial_length:], skip_special_tokens=False)
+                    if stop in generation:
+                        return True
+                elif self.match_on == 'tokens':
+                    if stop in input_ids[0][-len(stop):]:
+                        return True
+            return False
+
+        # For batched sequences: only halt if ALL sequences have hit a stop sequence
+        for seq in input_ids:
+            seq_matched = False
+            for stop in self.stops:
+                if self.match_on == 'text':
+                    generation = self.tokenizer.decode(seq[self.initial_length:], skip_special_tokens=False)
+                    if stop in generation:
+                        seq_matched = True
+                        break
+                elif self.match_on == 'tokens':
+                    if stop in seq[-len(stop):]:
+                        seq_matched = True
+                        break
+            if not seq_matched:
+                return False
+        return True
 
 class HuggingfaceModel(BaseModel):
     """Hugging Face Model."""
 
-    def __init__(self, model_name, stop_sequences=None, max_new_tokens=None):
+    def __init__(self, model_name, stop_sequences=None, max_new_tokens=None, arch='m3'):
         if max_new_tokens is None:
-            raise
+            raise ValueError("max_new_tokens must be specified")
         self.max_new_tokens = max_new_tokens
+        self.arch = arch.lower()
 
         if stop_sequences == 'default':
             stop_sequences = STOP_SEQUENCES
 
         if 'llava' in model_name.lower():
-            model_sub_name = get_model_name_from_path(model_name)
-            tokenizer, model, image_processor, context_len = load_pretrained_model(model_path=model_name,
-                                                                            model_base=None,
-                                                                            model_name=model_sub_name, 
-                                                                            load_4bit=True, 
-                                                                            use_flash_attn=False,
-                                                                            device_map='cuda:0')
+            llava_mods = load_llava_modules(arch=self.arch)
+            load_fn = llava_mods.get("load_pretrained_model") or load_pretrained_model
+            name_fn = llava_mods.get("get_model_name_from_path") or get_model_name_from_path
+            model_sub_name = name_fn(model_name)
+            tokenizer, model, image_processor, context_len = load_fn(
+                model_path=model_name,
+                model_base=None,
+                model_name=model_sub_name, 
+                load_4bit=True, 
+                use_flash_attn=False,
+                device_map='cuda:0',
+            )
+            apply_transformers_compatibility_patches(model)
+            if self.arch == "mqt":
+                if hasattr(model, "config"):
+                    setattr(model.config, "num_visual_tokens", 256)
+                if hasattr(model, "model") and hasattr(model.model, "config"):
+                    setattr(model.model.config, "num_visual_tokens", 256)
             self.tokenizer = tokenizer
             self.model = model
             self.image_processor = image_processor
-            # self.context_len = context_len
         else:
-            raise ValueError
+            raise ValueError(f"Unsupported model: {model_name}")
 
         self.model_name = model_name
         self.stop_sequences = stop_sequences + [self.tokenizer.eos_token]
@@ -132,12 +161,24 @@ class HuggingfaceModel(BaseModel):
         # print(new_prompt)
         return input_ids
         
-    def predict_prompt_image(self, prompt, image_path, temperature, top_p=1, beam_search=False, num_beams=0):
-
-        if image_path is None:
+    def preprocess_input(self, prompt: str, image_path: Any):
+        """Standardizes and caches multimodal input tensors once per question."""
+        import os
+        if not image_path or (isinstance(image_path, str) and not os.path.exists(image_path)):
             input_ids = self.process_input_without_image(prompt)
-            image_tensor=None
-            image_size=None
+            return input_ids, None, None
+        return self.process_input(prompt, image_path)
+
+    def predict_prompt_image(
+        self, prompt, image_path, temperature, top_p=1, beam_search=False, num_beams=0, preprocessed_inputs=None
+    ):
+        import os
+        if preprocessed_inputs is not None:
+            input_ids, image_tensor, image_size = preprocessed_inputs
+        elif not image_path or (isinstance(image_path, str) and not os.path.exists(image_path)):
+            input_ids = self.process_input_without_image(prompt)
+            image_tensor = None
+            image_size = None
         else:
             input_ids, image_tensor, image_size = self.process_input(prompt, image_path)
 
@@ -148,6 +189,118 @@ class HuggingfaceModel(BaseModel):
             'image_sizes': image_size
         }
         return self.predict(input_data=input_data, temperature=temperature, top_p=top_p, beam_search=beam_search, num_beams=num_beams)
+
+    def predict_batched_rollouts(
+        self,
+        prompt: str,
+        image_path: Any = None,
+        num_rollouts: int = 50,
+        temperature: float = 1.0,
+        top_p: float = 0.9,
+        layer_idx: int = -1,
+        preprocessed_inputs: Any = None,
+    ):
+        """
+        Generates num_rollouts sampled sequences in a single batched model.generate call.
+        Last token embeddings from target layer (layer_idx, default -1) are immediately detached
+        to CPU float16 to eliminate GPU memory spikes and fragmentation.
+        """
+        import os
+        import numpy as np
+
+        if preprocessed_inputs is not None:
+            input_ids, image_tensor, image_size = preprocessed_inputs
+        elif not image_path or (isinstance(image_path, str) and not os.path.exists(image_path)):
+            input_ids = self.process_input_without_image(prompt)
+            image_tensor = None
+            image_size = None
+        else:
+            input_ids, image_tensor, image_size = self.process_input(prompt, image_path)
+
+        input_ids = input_ids.to(device=self.device, non_blocking=True)
+        if image_tensor is not None:
+            image_tensor = image_tensor.to(dtype=torch.float16, device=self.device, non_blocking=True)
+
+        pad_token_id = self.tokenizer.eos_token_id
+        stopping_criteria = None
+        custom_stops = [s for s in (self.stop_sequences or []) if s != self.tokenizer.eos_token]
+        if custom_stops:
+            stopping_criteria = StoppingCriteriaList([
+                StoppingCriteriaSub(
+                    stops=custom_stops,
+                    initial_length=len(input_ids[0]),
+                    tokenizer=self.tokenizer,
+                )
+            ])
+
+        extra_kwargs = {}
+        if self.arch == "mqt":
+            extra_kwargs["num_visual_tokens"] = 256
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids,
+                images=image_tensor,
+                image_sizes=image_size,
+                max_new_tokens=self.max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                top_p=top_p,
+                num_return_sequences=num_rollouts,
+                use_cache=True,
+                return_dict_in_generate=True,
+                output_scores=True,
+                output_hidden_states=True,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                **extra_kwargs,
+            )
+
+        transition_scores = self.model.compute_transition_scores(
+            outputs.sequences, outputs.scores, normalize_logits=True
+        )
+        full_answer_list = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=False)
+        input_data_offset = len(prompt) if full_answer_list[0].startswith(prompt) else 0
+        n_input_token = len(input_ids[0]) if input_data_offset > 0 else 1
+
+        hidden = outputs.decoder_hidden_states if "decoder_hidden_states" in outputs else outputs.hidden_states
+
+        sliced_answers = []
+        log_likelihoods_list = []
+        embeddings_list = []
+
+        for ans_id in range(num_rollouts):
+            raw_ans = full_answer_list[ans_id][input_data_offset:]
+            stop_at = len(raw_ans)
+            if self.stop_sequences is not None:
+                for stop in self.stop_sequences:
+                    if stop in raw_ans:
+                        stop_at = min(stop_at, raw_ans.find(stop))
+            cleaned_ans = raw_ans[:stop_at].strip()
+            sliced_answers.append(cleaned_ans)
+
+            tok_stop = self.tokenizer(
+                full_answer_list[ans_id][:input_data_offset + stop_at], return_tensors="pt"
+            )["input_ids"].shape[1]
+            n_gen = max(1, tok_stop - n_input_token)
+
+            scores_seq = transition_scores[ans_id]
+            tok_lps = [float(s.item()) for s in scores_seq[:min(len(scores_seq), n_gen)]]
+            if not tok_lps:
+                tok_lps = [0.0]
+            log_likelihoods_list.append(tok_lps)
+
+            step_idx = min(n_gen - 1, len(hidden) - 1)
+            step_layers = hidden[step_idx]
+            target_layer = step_layers[layer_idx]
+            emb = target_layer[ans_id, -1, :].detach().to(torch.float16).cpu().numpy()
+            embeddings_list.append(emb)
+
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return sliced_answers, log_likelihoods_list, np.array(embeddings_list)
     
     def get_embedding_space(self, prompt, image_path):
         if image_path is None:

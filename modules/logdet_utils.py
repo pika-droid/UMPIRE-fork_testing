@@ -1,5 +1,4 @@
 import numpy as np
-from sklearn.utils.extmath import fast_logdet
 
 
 def normalize_embedding(x):
@@ -28,10 +27,25 @@ def get_normalized_entropy(x):
     x_ = [-np.sum(np.exp(i)*i) *(1/len(i)) for i in x]
     return np.average(x_)
 
-def compute_logdet(K, jitter=1e-8):
-    # seed = np.random.rand()
-    logdet_value = fast_logdet(K + np.identity(K.shape[0])*jitter)
-    return logdet_value
+def compute_logdet(K, jitter=1e-6):
+    eigvals = np.linalg.eigvalsh(0.5 * (K + K.T))
+    return float(np.sum(np.log(np.maximum(eigvals, 0.0) + jitter)))
+
+def slice_rollouts(sample, k):
+    s = dict(sample)
+    if 'generations_text' in s and s['generations_text'] is not None:
+        s['generations_text'] = s['generations_text'][:k]
+    if 'generations_log_likelihood' in s and s['generations_log_likelihood'] is not None:
+        s['generations_log_likelihood'] = s['generations_log_likelihood'][:k]
+    if 'norm_embedding' in s and s['norm_embedding'] is not None:
+        s['norm_embedding'] = s['norm_embedding'][:k]
+    if 'internal_embedding' in s and s['internal_embedding'] is not None:
+        s['internal_embedding'] = s['internal_embedding'][:k]
+    if 'embedding' in s and s['embedding'] is not None:
+        s['embedding'] = s['embedding'][:k]
+    if 'cluster_ids' in s and s['cluster_ids'] is not None:
+        s['cluster_ids'] = s['cluster_ids'][:k]
+    return s
 
 # Compute the eigenvalue-based score, adapted from https://github.com/D2I-ai/eigenscore/blob/main/func/metric.py
 def compute_eigenscore(row, jitter = 1e-3):
