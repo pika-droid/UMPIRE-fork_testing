@@ -13,6 +13,32 @@ from typing import Any
 import torch
 
 
+def patch_transformers_quantization() -> None:
+    """Strips load_in_4bit/8bit kwargs if quantization_config is passed (transformers >= 4.38 conflict)."""
+    try:
+        import transformers
+
+        if hasattr(transformers, "PreTrainedModel") and hasattr(
+            transformers.PreTrainedModel, "from_pretrained"
+        ):
+            orig_from_pretrained = transformers.PreTrainedModel.from_pretrained.__func__
+
+            @classmethod
+            def safe_from_pretrained(
+                cls: Any, pretrained_model_name_or_path: Any, *model_args: Any, **kwargs: Any
+            ) -> Any:
+                if "quantization_config" in kwargs:
+                    kwargs.pop("load_in_4bit", None)
+                    kwargs.pop("load_in_8bit", None)
+                return orig_from_pretrained(
+                    cls, pretrained_model_name_or_path, *model_args, **kwargs
+                )
+
+            setattr(transformers.PreTrainedModel, "from_pretrained", safe_from_pretrained)  # noqa: B010
+    except Exception:
+        pass
+
+
 def apply_transformers_compatibility_patches(model: Any) -> None:
     """
     Applies 3 essential monkey-patches to prevent transformers >= 4.38 GenerationMixin crashes:

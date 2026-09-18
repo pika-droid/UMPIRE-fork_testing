@@ -24,7 +24,7 @@ from .llava.conversation import conv_templates, SeparatorStyle
 
 from .base_model import BaseModel
 from .base_model import STOP_SEQUENCES
-from .patches import apply_transformers_compatibility_patches
+from .patches import apply_transformers_compatibility_patches, patch_transformers_quantization
 from .llava_compat import load_llava_modules
 
 class StoppingCriteriaSub(StoppingCriteria):
@@ -86,6 +86,7 @@ class HuggingfaceModel(BaseModel):
             load_fn = llava_mods.get("load_pretrained_model") or load_pretrained_model
             name_fn = llava_mods.get("get_model_name_from_path") or get_model_name_from_path
             model_sub_name = name_fn(model_name)
+            patch_transformers_quantization()
             try:
                 tokenizer, model, image_processor, context_len = load_fn(
                     model_path=model_name,
