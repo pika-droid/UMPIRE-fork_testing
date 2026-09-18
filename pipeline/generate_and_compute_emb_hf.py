@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import pathlib
 import pickle
@@ -207,6 +208,16 @@ for line in tqdm(questions, total=len(questions)):
     sequence_dict['internal_embedding'] = embedding
     sequences.append(sequence_dict)     
     processed_qids.add(str(idx))
+
+    # Immediate VRAM garbage collection to prevent cross-sample accumulation
+    del cur_prompt, sequence_dict
+    del most_likely_generation_output_text, most_likely_generation_log_likelihood, most_likely_generation_embedding
+    del generation_list, generation_log_likelihood_list, embedding
+    if preprocessed is not None:
+        del preprocessed
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if len(sequences) % 100 == 0:
         with open(tmp_out, 'wb') as outfile:

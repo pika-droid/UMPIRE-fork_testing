@@ -319,7 +319,12 @@ class HuggingfaceModel(BaseModel):
             emb = target_layer[ans_id, -1, :].detach().to(torch.float16).cpu().numpy()
             embeddings_list.append(emb)
 
-        del outputs
+        del outputs, hidden, transition_scores
+        if "step_layers" in locals():
+            del step_layers
+        if "target_layer" in locals():
+            del target_layer
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -585,17 +590,25 @@ class HuggingfaceModel(BaseModel):
             log_likelihoods_list.append(log_likelihoods) # log_likelihoods: array
 
         if len(sliced_answer_list) == 1:
-            forward_llh = self.compute_llh_foward(input_ids, image_tensor, image_sizes, temperature, outputs.sequences)
-            return sliced_answer_list[0], log_likelihoods_list[0], last_token_embedding_list[0]
+            res = (sliced_answer_list[0], log_likelihoods_list[0], last_token_embedding_list[0])
         else:
-            
             last_token_embedding_list = torch.stack(last_token_embedding_list)
             if len(last_token_embedding_list.shape) == 3:
-                last_token_embedding_list = last_token_embedding_list.permute(1, 0, 2) # reshape to (num_layer, num_gen, emb_length)
+                last_token_embedding_list = last_token_embedding_list.permute(1, 0, 2)  # reshape to (num_layer, num_gen, emb_length)
             if beam_search:
                 beam_sequence_scores = outputs.sequences_scores.to('cpu').tolist()
-                return sliced_answer_list, log_likelihoods_list, last_token_embedding_list, beam_sequence_scores
-            return sliced_answer_list, log_likelihoods_list, last_token_embedding_list
+                res = (sliced_answer_list, log_likelihoods_list, last_token_embedding_list, beam_sequence_scores)
+            else:
+                res = (sliced_answer_list, log_likelihoods_list, last_token_embedding_list)
+
+        del outputs
+        if "hidden" in locals():
+            del hidden
+        if "transition_scores" in locals():
+            del transition_scores
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return res
 
     def get_p_true(self, input_data):
         """Get the probability of the model anwering A (True) for the given input."""

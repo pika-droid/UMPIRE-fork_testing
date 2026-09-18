@@ -176,6 +176,7 @@ if __name__ == "__main__":
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
+    entailment_model = None
     for k in budgets:
         current_results = [slice_rollouts(s, k) for s in llava_results] if k is not None else llava_results
         image_df = pd.DataFrame().from_dict(current_results)
@@ -198,8 +199,9 @@ if __name__ == "__main__":
 
         from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao    
         if args.re_cluster_semantic_entropy or 'cluster_ids' not in image_df.columns:
-            from modules.semantic_entropy import EntailmentDeberta
-            entailment_model = EntailmentDeberta()
+            if entailment_model is None:
+                from modules.semantic_entropy import EntailmentDeberta
+                entailment_model = EntailmentDeberta()
             image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_scratch(x, entailment_model), axis=1)
         else:
             image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_cluster_ids(x), axis=1)
