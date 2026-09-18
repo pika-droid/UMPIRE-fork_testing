@@ -7,14 +7,77 @@ matryoshka_vis_token_scale) to prevent TypeError on modern HuggingFace Transform
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import Any
 
 import torch
 
 
+def _make_safe_rotary_forward(orig_fn: Any) -> Any:
+    @functools.wraps(orig_fn)
+    def safe_rotary_forward(*args: Any, **kwargs: Any) -> Any:
+        if not args:
+            return orig_fn(*args, **kwargs)
+
+        if hasattr(args[0], "inv_freq"):
+            self_obj = args[0]
+            x = args[1] if len(args) > 1 else None
+            rest_args = args[2:]
+        else:
+            self_obj = getattr(orig_fn, "__self__", None)
+            x = args[0]
+            rest_args = args[1:]
+
+        target_dev = getattr(x, "device", None)
+        if target_dev is None and len(rest_args) > 0:
+            target_dev = getattr(rest_args[0], "device", None)
+        if target_dev is None and "position_ids" in kwargs:
+            target_dev = getattr(kwargs["position_ids"], "device", None)
+
+        if (
+            self_obj is not None
+            and target_dev is not None
+            and hasattr(self_obj, "inv_freq")
+            and self_obj.inv_freq is not None
+            and self_obj.inv_freq.device != target_dev
+        ):
+            self_obj.inv_freq = self_obj.inv_freq.to(target_dev)
+
+        return orig_fn(*args, **kwargs)
+
+    safe_rotary_forward._is_device_safe = True  # type: ignore[attr-defined]
+    return safe_rotary_forward
+
+
+def patch_llama_rotary_embedding() -> None:
+    """
+    Ensures inv_freq buffer in LlamaRotaryEmbedding is dynamically moved
+    to the target execution device (e.g. cuda:0) if loaded on CPU during 4-bit quantization.
+    """
+    with contextlib.suppress(Exception):
+        from transformers.models.llama import modeling_llama
+
+        classes_to_patch = [
+            getattr(modeling_llama, name)
+            for name in [
+                "LlamaRotaryEmbedding",
+                "LlamaLinearScalingRotaryEmbedding",
+                "LlamaDynamicNTKScalingRotaryEmbedding",
+            ]
+            if hasattr(modeling_llama, name)
+        ]
+        for cls in classes_to_patch:
+            if hasattr(cls, "forward"):
+                orig_fwd = cls.forward
+                if getattr(orig_fwd, "_is_device_safe", False):
+                    continue
+                cls.forward = _make_safe_rotary_forward(orig_fwd)
+
+
 def patch_transformers_quantization() -> None:
     """Strips load_in_4bit/8bit kwargs if quantization_config is passed (transformers >= 4.38 conflict)."""
+    patch_llama_rotary_embedding()
     try:
         import transformers
 
@@ -76,11 +139,29 @@ def patch_transformers_quantization() -> None:
 
 def apply_transformers_compatibility_patches(model: Any) -> None:
     """
-    Applies 3 essential monkey-patches to prevent transformers >= 4.38 GenerationMixin crashes:
+    Applies essential monkey-patches to prevent transformers >= 4.38 GenerationMixin crashes:
     1. Removes cache_position and num_logits_to_keep from forward kwargs.
     2. Removes cache_position and num_logits_to_keep from prepare_inputs_for_generation.
     3. Protects matryoshka_vis_token_scale in _validate_model_kwargs.
+    4. Ensures rotary embedding inv_freq buffers are on the model's active device.
     """
+    patch_llama_rotary_embedding()
+
+    target_device = None
+    if hasattr(model, "parameters"):
+        for p in model.parameters():
+            if hasattr(p, "device") and p.device.type == "cuda":
+                target_device = p.device
+                break
+    if target_device is None and torch.cuda.is_available():
+        target_device = torch.device("cuda:0")
+
+    if target_device is not None and hasattr(model, "modules"):
+        for m in model.modules():
+            if hasattr(m, "inv_freq") and getattr(m, "inv_freq", None) is not None:
+                with contextlib.suppress(Exception):
+                    m.inv_freq = m.inv_freq.to(target_device)
+
     orig_forward = model.forward
 
     @functools.wraps(orig_forward)
