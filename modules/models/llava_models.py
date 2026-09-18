@@ -86,14 +86,32 @@ class HuggingfaceModel(BaseModel):
             load_fn = llava_mods.get("load_pretrained_model") or load_pretrained_model
             name_fn = llava_mods.get("get_model_name_from_path") or get_model_name_from_path
             model_sub_name = name_fn(model_name)
-            tokenizer, model, image_processor, context_len = load_fn(
-                model_path=model_name,
-                model_base=None,
-                model_name=model_sub_name, 
-                load_4bit=True, 
-                use_flash_attn=False,
-                device_map='cuda:0',
-            )
+            try:
+                tokenizer, model, image_processor, context_len = load_fn(
+                    model_path=model_name,
+                    model_base=None,
+                    model_name=model_sub_name, 
+                    load_4bit=True, 
+                    use_flash_attn=False,
+                    device_map='cuda:0',
+                )
+            except Exception as e:
+                if "bitsandbytes" in str(e).lower() or "quantization" in str(e).lower():
+                    logging.warning(
+                        f"4-bit loading failed ({e}). Falling back to 16-bit float16 loading..."
+                    )
+                    tokenizer, model, image_processor, context_len = load_fn(
+                        model_path=model_name,
+                        model_base=None,
+                        model_name=model_sub_name, 
+                        load_4bit=False, 
+                        load_8bit=False,
+                        torch_dtype=torch.float16,
+                        use_flash_attn=False,
+                        device_map='cuda:0',
+                    )
+                else:
+                    raise e
             apply_transformers_compatibility_patches(model)
             if self.arch == "mqt":
                 if hasattr(model, "config"):
