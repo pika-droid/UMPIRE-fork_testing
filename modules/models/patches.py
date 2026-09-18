@@ -35,6 +35,23 @@ def patch_transformers_quantization() -> None:
                 )
 
             setattr(transformers.PreTrainedModel, "from_pretrained", safe_from_pretrained)  # noqa: B010
+
+        orig_to = torch.nn.Module.to
+
+        def safe_to(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return orig_to(self, *args, **kwargs)
+            except ValueError as e:
+                err_msg = str(e).lower()
+                if (
+                    "not supported for `4-bit`" in err_msg
+                    or "not supported for `8-bit`" in err_msg
+                    or "bitsandbytes" in err_msg
+                ):
+                    return self
+                raise
+
+        torch.nn.Module.to = safe_to  # type: ignore[assignment]
     except Exception:
         pass
 
