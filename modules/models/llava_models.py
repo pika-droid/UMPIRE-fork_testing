@@ -260,73 +260,76 @@ class HuggingfaceModel(BaseModel):
         if self.arch == "mqt":
             extra_kwargs["num_visual_tokens"] = 256
 
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids,
-                images=image_tensor,
-                image_sizes=image_size,
-                max_new_tokens=self.max_new_tokens,
-                temperature=temperature,
-                do_sample=True,
-                top_p=top_p,
-                num_return_sequences=num_rollouts,
-                use_cache=True,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=True,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=pad_token_id,
-                **extra_kwargs,
-            )
-
-        transition_scores = self.model.compute_transition_scores(
-            outputs.sequences, outputs.scores, normalize_logits=True
-        )
-        full_answer_list = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=False)
-        input_data_offset = len(prompt) if full_answer_list[0].startswith(prompt) else 0
-        n_input_token = len(input_ids[0]) if input_data_offset > 0 else 1
-
-        hidden = outputs.decoder_hidden_states if "decoder_hidden_states" in outputs else outputs.hidden_states
-
+        batch_chunk_size = min(num_rollouts, 10)
         sliced_answers = []
         log_likelihoods_list = []
         embeddings_list = []
 
-        for ans_id in range(num_rollouts):
-            raw_ans = full_answer_list[ans_id][input_data_offset:]
-            stop_at = len(raw_ans)
-            if self.stop_sequences is not None:
-                for stop in self.stop_sequences:
-                    if stop in raw_ans:
-                        stop_at = min(stop_at, raw_ans.find(stop))
-            cleaned_ans = raw_ans[:stop_at].strip()
-            sliced_answers.append(cleaned_ans)
+        for chunk_start in range(0, num_rollouts, batch_chunk_size):
+            chunk_n = min(batch_chunk_size, num_rollouts - chunk_start)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids,
+                    images=image_tensor,
+                    image_sizes=image_size,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=top_p,
+                    num_return_sequences=chunk_n,
+                    use_cache=True,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    output_hidden_states=True,
+                    stopping_criteria=stopping_criteria,
+                    pad_token_id=pad_token_id,
+                    **extra_kwargs,
+                )
 
-            tok_stop = self.tokenizer(
-                full_answer_list[ans_id][:input_data_offset + stop_at], return_tensors="pt"
-            )["input_ids"].shape[1]
-            n_gen = max(1, tok_stop - n_input_token)
+            transition_scores = self.model.compute_transition_scores(
+                outputs.sequences, outputs.scores, normalize_logits=True
+            )
+            full_answer_list = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=False)
+            input_data_offset = len(prompt) if full_answer_list[0].startswith(prompt) else 0
+            n_input_token = len(input_ids[0]) if input_data_offset > 0 else 1
 
-            scores_seq = transition_scores[ans_id]
-            tok_lps = [float(s.item()) for s in scores_seq[:min(len(scores_seq), n_gen)]]
-            if not tok_lps:
-                tok_lps = [0.0]
-            log_likelihoods_list.append(tok_lps)
+            hidden = outputs.decoder_hidden_states if "decoder_hidden_states" in outputs else outputs.hidden_states
 
-            step_idx = min(n_gen - 1, len(hidden) - 1)
-            step_layers = hidden[step_idx]
-            target_layer = step_layers[layer_idx]
-            emb = target_layer[ans_id, -1, :].detach().to(torch.float16).cpu().numpy()
-            embeddings_list.append(emb)
+            for ans_id in range(chunk_n):
+                raw_ans = full_answer_list[ans_id][input_data_offset:]
+                stop_at = len(raw_ans)
+                if self.stop_sequences is not None:
+                    for stop in self.stop_sequences:
+                        if stop in raw_ans:
+                            stop_at = min(stop_at, raw_ans.find(stop))
+                cleaned_ans = raw_ans[:stop_at].strip()
+                sliced_answers.append(cleaned_ans)
 
-        del outputs, hidden, transition_scores
-        if "step_layers" in locals():
-            del step_layers
-        if "target_layer" in locals():
-            del target_layer
+                tok_stop = self.tokenizer(
+                    full_answer_list[ans_id][:input_data_offset + stop_at], return_tensors="pt"
+                )["input_ids"].shape[1]
+                n_gen = max(1, tok_stop - n_input_token)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+                scores_seq = transition_scores[ans_id]
+                tok_lps = [float(s.item()) for s in scores_seq[:min(len(scores_seq), n_gen)]]
+                if not tok_lps:
+                    tok_lps = [0.0]
+                log_likelihoods_list.append(tok_lps)
+
+                step_idx = min(n_gen - 1, len(hidden) - 1)
+                step_layers = hidden[step_idx]
+                target_layer = step_layers[layer_idx]
+                emb = target_layer[ans_id, -1, :].detach().to(torch.float16).cpu().numpy()
+                embeddings_list.append(emb)
+
+            del outputs, hidden, transition_scores
+            if "step_layers" in locals():
+                del step_layers
+            if "target_layer" in locals():
+                del target_layer
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return sliced_answers, log_likelihoods_list, np.array(embeddings_list)
     
