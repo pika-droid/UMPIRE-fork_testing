@@ -2,7 +2,7 @@ import numpy as np
 
 
 def normalize_embedding(x):
-    return np.array([e / np.linalg.norm(e, ord=2) for e in x])
+    return np.array([e / np.linalg.norm(e, ord=2) for e in x], dtype=np.float32)
 
 def get_generation_embeddings(sample):
     embeddings = np.asarray(sample['norm_embedding']) # take norm_embedding instead of embedding to avoid the need to normalize here
@@ -28,6 +28,7 @@ def get_normalized_entropy(x):
     return np.average(x_)
 
 def compute_logdet(K, jitter=1e-6):
+    K = np.asarray(K, dtype=np.float64)
     eigvals = np.linalg.eigvalsh(0.5 * (K + K.T))
     return float(np.sum(np.log(np.maximum(eigvals, 0.0) + jitter)))
 
@@ -49,7 +50,7 @@ def slice_rollouts(sample, k):
 
 # Compute the eigenvalue-based score, adapted from https://github.com/D2I-ai/eigenscore/blob/main/func/metric.py
 def compute_eigenscore(row, jitter = 1e-3):
-    embedding = get_generation_embeddings(row)
+    embedding = np.asarray(get_generation_embeddings(row), dtype=np.float64)
     CovMatrix = np.cov(embedding)
     # CovMatrix = np.matmul(embedding, embedding.T)
     u, s, vT = np.linalg.svd(CovMatrix+jitter*np.eye(CovMatrix.shape[0]))
