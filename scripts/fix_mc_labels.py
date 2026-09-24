@@ -18,6 +18,7 @@ import argparse
 import os
 import pickle
 import re
+import json
 from pathlib import Path
 
 
@@ -86,14 +87,64 @@ def fix_generations_file(file_path: Path | str) -> int:
     return fixed_count
 
 
+def fix_vllm_safety_file(file_path: Path | str) -> int:
+    """Fixes ground-truth labels for vllm-safety dataset."""
+    path = Path(file_path)
+    if not path.exists():
+        return 0
+
+    map_file = Path(__file__).resolve().parent.parent / 'data' / 'vllm_safety_ground_truth_map.json'
+    gt_map = {}
+    if map_file.exists():
+        with open(map_file, encoding='utf-8') as f:
+            gt_map = json.load(f)
+
+    print(f"Loading {path}...")
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+
+    correct_count = 0
+    for s in data:
+        qid = str(s.get('question_id', ''))
+        pred = str(s.get('most_likely_generation_text', '')).strip().lower()
+
+        if qid in gt_map:
+            gt = gt_map[qid].strip().lower()
+            s['answers'] = [gt]
+            is_corr = 1.0 if (pred == gt or gt in pred.split()) else 0.0
+        else:
+            is_corr = 0.0
+            for a in s.get('answers', []):
+                a_clean = str(a).strip().lower()
+                if a_clean and re.search(r'\b' + re.escape(a_clean) + r'\b', pred):
+                    is_corr = 1.0
+                    break
+
+        if is_corr == 1.0:
+            correct_count += 1
+        s['exact_match'] = is_corr
+        s['rougeL_to_target'] = is_corr
+        s['rouge1_to_target'] = is_corr
+        s['rouge2_to_target'] = is_corr
+
+    print(f"Processed {len(data)} vllm-safety samples: {correct_count} correct ({correct_count / len(data):.1%}).")
+    with open(path, 'wb') as f:
+        pickle.dump(data, f)
+    print(f"Successfully saved updated file: {path}")
+    return correct_count
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Fix multiple choice labels in generations.pkl")
+    parser = argparse.ArgumentParser(description="Fix multiple choice and safety labels in generations.pkl")
     parser.add_argument('--input_file', type=str, default=None, help="Path to a single generations.pkl")
     parser.add_argument('--root_dir', type=str, default="output/generations", help="Root directory containing generations")
     args = parser.parse_args()
 
     if args.input_file:
-        fix_generations_file(args.input_file)
+        if 'vllm-safety' in args.input_file:
+            fix_vllm_safety_file(args.input_file)
+        else:
+            fix_generations_file(args.input_file)
     else:
         root = Path(args.root_dir)
         mc_datasets = ['scienceqa', 'ai2d']
@@ -103,6 +154,11 @@ def main():
                 if gen_file.exists():
                     print(f"\n--- Fixing {arch}/{ds} ---")
                     fix_generations_file(gen_file)
+
+            safety_file = root / arch / 'vllm-safety' / 'generations.pkl'
+            if safety_file.exists():
+                print(f"\n--- Fixing {arch}/vllm-safety ---")
+                fix_vllm_safety_file(safety_file)
 
 
 if __name__ == '__main__':
