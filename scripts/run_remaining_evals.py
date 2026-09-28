@@ -13,6 +13,7 @@ datasets = [
     'vqav2',
     'avqa',
     'vllm-safety',
+    'ai2d',
 ]
 
 repo_root = Path(__file__).resolve().parent.parent

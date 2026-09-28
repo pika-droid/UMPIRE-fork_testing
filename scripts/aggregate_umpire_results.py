@@ -85,8 +85,9 @@ def aggregate_and_save(rows: list[dict[str, Any]], output_dir: Path) -> pd.DataF
     logger.info(f"Saved {len(df)} summary records to {csv_path} and {json_path}")
 
     # Compute macro-averages per (arch, method, K)
-    if "cece" in df.columns and "auc" in df.columns:
-        macro = df.groupby(["architecture", "method", "rollout_budget_k"])[["cece", "auc"]].mean().reset_index()
+    avg_cols = [c for c in ["auc", "cece", "cace", "pearsonr", "aurac", "tpr_at_0.1_fpr", "tpr_at_0.01_fpr"] if c in df.columns]
+    if avg_cols:
+        macro = df.groupby(["architecture", "method", "rollout_budget_k"])[avg_cols].mean().reset_index()
         macro_csv = output_dir / "umpire_macro_averages.csv"
         macro.to_csv(macro_csv, index=False)
         logger.info(f"Saved macro averages across benchmarks to {macro_csv}")

@@ -150,7 +150,7 @@ def split_balanced_data(image_df, calibration_ratio, random_seed, eval_col='exac
         test_df = image_df.iloc[num_samples:].reset_index(drop=True)
     return dev_df, test_df
 
-def get_calibrate_ece(image_df, unc_column, eval_col='exact_match', num_bins=15, random_seed=10, calibration_ratio=0.05, model_type='minmax', ece_mode='ece', is_uncertainty=True, num_trail=1):
+def get_calibrate_ece(image_df, unc_column, eval_col='exact_match', num_bins=15, random_seed=10, calibration_ratio=0.05, model_type='minmax', ece_mode='ece', is_uncertainty=True, num_trail=1, return_both=False):
     # split into dev set and test set with balance correct and wrong answers
     random_seed_list = [random_seed + i for i in range(num_trail)]
     metric_list = []
@@ -182,11 +182,16 @@ def get_calibrate_ece(image_df, unc_column, eval_col='exact_match', num_bins=15,
             test_df['u_score'] = iso_reg.predict(x_test)
         else:
             print("No model")
-        if ece_mode == 'ece':
-            metric = um.ece(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
-        elif ece_mode == 'ace':
-            metric = um.ace(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
-        metric_list.append(metric)
+        if return_both:
+            ece_m = um.ece(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
+            ace_m = um.ace(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
+            metric_list.append((ece_m, ace_m))
+        else:
+            if ece_mode == 'ece':
+                metric = um.ece(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
+            elif ece_mode == 'ace':
+                metric = um.ace(probs=test_df['u_score'], labels=test_df[eval_col].astype(int), num_bins=num_bins)
+            metric_list.append(metric)
     if num_trail == 1:
         return metric_list[0]
     else:
@@ -238,7 +243,7 @@ def df_to_markdown_bold(df, index=True):
     for col in df.columns:
         if df[col].dtype not in [float, int]:
             continue
-        if col == 'ece' or col == 'ace' or col == 'cece':
+        if col in ['ece', 'ace', 'cece', 'cace']:
             min_val = df[col].min()
             df_markdown[col] = df[col].apply(lambda x: f"\033[1m{x:.3f}\033[0m" if x == min_val else f'{x:.3f}')
         else:
@@ -250,7 +255,7 @@ def df_to_markdown_bold(df, index=True):
 def df_bold_value(df, left_bold="\033[1m", right_bold="\033[0m", take_max=None):
     if take_max is None:
         for col in df.columns:
-            if col == 'ece' or col == 'ace' or col == 'cece':
+            if col in ['ece', 'ace', 'cece', 'cace']:
                 min_val = df[col].min()
                 df[col] = df[col].apply(lambda x: f"{left_bold}{x:.3f}{right_bold}" if x == min_val else f'{x:.3f}')
             else:

@@ -59,16 +59,16 @@ def compute_umpire(sample, jitter=1e-8, alpha=1, length_normalize=False):
 
 ###### Semantic Entropy ######
 # Adapted from https://github.com/lorenzkuhn/semantic_uncertainty
-def compute_semantic_entropy_from_scratch(sample, entailment_model):
-    texts = sample['generations_text']
+def get_cluster_ids_for_sample(sample, entailment_model):
+    texts = sample.get('generations_text', [])
     if not texts:
-        return 0.0
+        return []
     norm_texts = [t.strip() for t in texts]
     unique_texts = list(dict.fromkeys(norm_texts))
     if len(unique_texts) <= 1:
-        return 0.0
+        return [0] * len(texts)
 
-    from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao
+    from modules.semantic_entropy import get_semantic_ids
     # Fast-path: if there are duplicate answers, only run DeBERTa on unique representatives
     if len(unique_texts) < len(norm_texts):
         unique_cluster_ids = get_semantic_ids(
@@ -86,14 +86,15 @@ def compute_semantic_entropy_from_scratch(sample, entailment_model):
             strict_entailment=True,
             example=None,
         )
+    return cluster_ids
 
-    # Sum log-likelihoods for each token sequence
+def compute_semantic_entropy_from_scratch(sample, entailment_model):
+    cluster_ids = get_cluster_ids_for_sample(sample, entailment_model)
+    sample['cluster_ids'] = cluster_ids
+    from modules.semantic_entropy import logsumexp_by_id, predictive_entropy_rao
     llh_sums = [np.sum(llh) for llh in sample['generations_log_likelihood']]
-    # Aggregate by cluster
     log_likelihood_by_cluster = logsumexp_by_id(cluster_ids, llh_sums)
-    # Compute Semantic Entropy
-    semantic_entropy_score = predictive_entropy_rao(log_likelihood_by_cluster)
-    return semantic_entropy_score
+    return predictive_entropy_rao(log_likelihood_by_cluster)
 
 def compute_semantic_entropy_from_cluster_ids(sample):
     # Get semantic clusters from pre-computed cluster ids in the sample
@@ -120,14 +121,14 @@ def update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=15, eval_c
     for col in conf_col_to_eval_list + unc_col_to_eval_list:
         if col in conf_col_to_eval_list:
             auc = ROC_AUROC(image_wrong_df[col], image_correct_df[col])[-1]
-            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, ece_mode='ece', is_uncertainty=False)
+            cece, cace = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, is_uncertainty=False, return_both=True)
             tpr_at_10_fpr = get_tpr_at_fpr(image_wrong_df[col], image_correct_df[col], 0.1)
             tpr_at_1_fpr = get_tpr_at_fpr(image_wrong_df[col], image_correct_df[col], 0.01)
             aurac = compute_aurac_from_image_df(image_df, col, uncertainty=False, eval_col=eval_col)
             pearsonr = -compute_pearsonr(image_df[col], image_df[eval_col], num_bins=cpc_num_bins)[0]
         else:
             auc = ROC_AUROC(image_correct_df[col], image_wrong_df[col])[-1]
-            cece = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, ece_mode='ece')
+            cece, cace = get_calibrate_ece(image_df, col, eval_col=eval_col, num_bins=ece_num_bins, random_seed=10, calibration_ratio=0.05, model_type=model_type, return_both=True)
             tpr_at_10_fpr = get_tpr_at_fpr(image_correct_df[col], image_wrong_df[col], 0.1)
             tpr_at_1_fpr = get_tpr_at_fpr(image_correct_df[col], image_wrong_df[col], 0.01)
             aurac = compute_aurac_from_image_df(image_df, col, uncertainty=True, eval_col=eval_col)
@@ -136,6 +137,7 @@ def update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=15, eval_c
         result_dict[col] = {
             'auc': auc,
             'cece': cece,
+            'cace': cace,
             'pearsonr': pearsonr, 
             'tpr_at_0.1_fpr': tpr_at_10_fpr,
             'tpr_at_0.01_fpr': tpr_at_1_fpr,
@@ -176,7 +178,31 @@ if __name__ == "__main__":
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
+    cluster_cache_file = os.path.join(args.output_dir, 'cluster_cache.pkl')
+    uncertainty_df_file = os.path.join(args.output_dir, 'image_df_with_uncertainty.pkl')
     entailment_model = None
+
+    # Cluster caching: check if clusters are already cached or if cluster_ids are in samples
+    if os.path.exists(cluster_cache_file) and not args.re_cluster_semantic_entropy:
+        print(f"Loading cached clusters from {cluster_cache_file}...")
+        with open(cluster_cache_file, 'rb') as f:
+            cluster_cache = pickle.load(f)
+        if len(cluster_cache) == len(llava_results):
+            for s, cids in zip(llava_results, cluster_cache):
+                s['cluster_ids'] = cids
+    elif 'cluster_ids' not in llava_results[0] or args.re_cluster_semantic_entropy:
+        print("Pre-clustering semantic entropy on full rollouts (cached for all K and zero-shot)...")
+        from modules.semantic_entropy import EntailmentDeberta
+        entailment_model = EntailmentDeberta()
+        cluster_cache = []
+        for s in tqdm(llava_results, desc="Clustering rollouts"):
+            cids = get_cluster_ids_for_sample(s, entailment_model)
+            s['cluster_ids'] = cids
+            cluster_cache.append(cids)
+        with open(cluster_cache_file, 'wb') as f:
+            pickle.dump(cluster_cache, f)
+        print(f"Saved {len(cluster_cache)} sample clusters to {cluster_cache_file}")
+
     for k in budgets:
         current_results = [slice_rollouts(s, k) for s in llava_results] if k is not None else llava_results
         image_df = pd.DataFrame().from_dict(current_results)
@@ -198,13 +224,13 @@ if __name__ == "__main__":
         image_df['eigen_score'] = image_df.apply(lambda x: compute_eigenscore(x, jitter=args.jitter), axis=1)
 
         from modules.semantic_entropy import get_semantic_ids, logsumexp_by_id, predictive_entropy_rao    
-        if args.re_cluster_semantic_entropy or 'cluster_ids' not in image_df.columns:
+        if 'cluster_ids' in image_df.columns and not args.re_cluster_semantic_entropy:
+            image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_cluster_ids(x), axis=1)
+        else:
             if entailment_model is None:
                 from modules.semantic_entropy import EntailmentDeberta
                 entailment_model = EntailmentDeberta()
             image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_scratch(x, entailment_model), axis=1)
-        else:
-            image_df['semantic_entropy'] = image_df.apply(lambda x: compute_semantic_entropy_from_cluster_ids(x), axis=1)
 
         unc_metrics = ['ln_entropy', 'semantic_entropy', 'eigen_score', 'umpire']
         result_dict = update_result_based_on_df(image_df, cpc_num_bins=50, ece_num_bins=50, unc_col_to_eval_list=unc_metrics, model_type=args.calibration_model)
@@ -218,6 +244,12 @@ if __name__ == "__main__":
             all_k_results[f"k_{k}"] = result_dict
             if k == max(budgets):
                 result_df.to_json(os.path.join(args.output_dir, 'umpire_results.json'), orient='index', indent=4)
+
+        # Save lightweight image_df_with_uncertainty on full/max budget for instant zero-shot transfer
+        if k == (max(budgets) if budgets != [None] else None):
+            save_cols = [c for c in image_df.columns if c not in ['embedding', 'internal_embedding', 'norm_embedding']]
+            image_df[save_cols].to_pickle(uncertainty_df_file)
+            print(f"Saved lightweight uncertainty DataFrame to {uncertainty_df_file}")
 
     if all_k_results:
         import json
